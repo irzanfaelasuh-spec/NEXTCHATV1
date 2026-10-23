@@ -1,60 +1,61 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    function au() { return request.auth != null; }
-    function d() { return request.resource.data; }
-    function ch() { return request.resource.data.diff(resource.data).affectedKeys(); }
-
-    match /users/{u} {
-      allow get: if au();
-      allow create: if au() && u == request.auth.uid
-        && d().keys().hasOnly(['name','username','number','about','createdAt'])
-        && d().name is string && d().name.size() <= 20 && d().about is string && d().about.size() <= 140
-        && d().createdAt == request.time
-        && getAfter(/databases/$(database)/documents/numbers/$(d().number)).data.uid == u
-        && getAfter(/databases/$(database)/documents/usernames/$(d().username)).data.uid == u;
-      allow update: if au() && u == request.auth.uid && ch().hasOnly(['name','about']);
-      match /contacts/{c} { allow read, write: if au() && request.auth.uid == u; }
-    }
-    // create only works when the doc does not exist yet -> unique usernames and numbers
-    match /usernames/{n} { allow get: if au(); allow create: if au() && d().keys().hasOnly(['uid']) && d().uid == request.auth.uid; }
-    match /numbers/{n}   { allow get: if au(); allow create: if au() && d().keys().hasOnly(['uid']) && d().uid == request.auth.uid; }
-
-    match /chats/{c} {
-      allow read: if au() && request.auth.uid in resource.data.members;
-      allow create: if au() && request.auth.uid in d().members && d().members.size() == 2
-        && d().members.hasAll(c.split('_')) && d().lastText is string && d().lastText.size() <= 60;
-      allow update: if au() && request.auth.uid in resource.data.members && ch().hasOnly(['lastText','lastAt']);
-      match /messages/{m} {
-        allow read: if au() && request.auth.uid in c.split('_');
-        allow create: if au() && request.auth.uid in c.split('_') && d().from == request.auth.uid
-          && d().keys().hasOnly(['from','text','createdAt','replyTo'])
-          && d().text is string && d().text.size() > 0 && d().text.size() <= 2000 && d().createdAt == request.time
-          && (d().replyTo == null || d().replyTo is map);
-        allow update: if au() && request.auth.uid in c.split('_') && (
-          (resource.data.from == request.auth.uid && ch().hasOnly(['text','deleted','replyTo'])
-            && d().text == 'This message has been deleted' && d().deleted == true)
-          || ch().hasOnly(['hiddenFor']));
+    function signedIn(){ return request.auth != null; }
+    function self(uid){ return signedIn() && request.auth.uid == uid; }
+    function member(cid){ return signedIn() && request.auth.uid in get(/databases/$(database)/documents/conversations/$(cid)).data.participants; }
+    match /users/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow create: if self(uid) && request.resource.data.uid == uid
+        && request.resource.data.keys().hasOnly(['uid','displayName','username','number','about','createdAt','photoURL'])
+        && request.resource.data.displayName is string && request.resource.data.number is string;
+      allow update: if self(uid) && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['displayName','about','photoURL']);
+      allow delete: if false;
+      match /contacts/{contactUid} {
+        allow read: if self(uid);
+        allow create, update: if self(uid) && request.resource.data.uid == contactUid
+          && request.resource.data.keys().hasOnly(['uid','displayName','number','lastMessage','createdAt']);
+        allow delete: if self(uid);
       }
     }
-
-    match /calls/{id} {
-      allow read: if au() && (resource.data.caller == request.auth.uid || resource.data.callee == request.auth.uid);
-      allow create: if au() && d().caller == request.auth.uid && d().callee is string && d().callee != request.auth.uid
-        && d().keys().hasOnly(['caller','callee','type','status','offer','createdAt'])
-        && d().status == 'ringing' && d().type in ['audio','video'] && d().createdAt == request.time;
-      allow update: if au() && (
-        (resource.data.callee == request.auth.uid && resource.data.status == 'ringing'
-          && d().status in ['accepted','rejected'] && ch().hasOnly(['status','answer']))
-        || (resource.data.caller == request.auth.uid && resource.data.status == 'ringing'
-          && d().status in ['cancelled','missed'] && ch().hasOnly(['status']))
-        || ((resource.data.caller == request.auth.uid || resource.data.callee == request.auth.uid)
-          && resource.data.status == 'accepted' && d().status == 'ended' && ch().hasOnly(['status'])));
-      match /cands/{x} {
-        function mem() { let c = get(/databases/$(database)/documents/calls/$(id)).data; return request.auth.uid in [c.caller, c.callee]; }
-        allow read, delete: if au() && mem();
-        allow create: if au() && mem() && d().from == request.auth.uid && d().c is string && d().c.size() < 2000;
+    match /numbers/{number} {
+      allow read: if signedIn();
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid
+        && !exists(/databases/$(database)/documents/numbers/$(number));
+      allow update, delete: if false;
+    }
+    match /conversations/{cid} {
+      allow read: if signedIn() && request.auth.uid in resource.data.participants;
+      allow create: if signedIn() && request.resource.data.participants is list
+        && request.auth.uid in request.resource.data.participants
+        && request.resource.data.participants.size() == 2;
+      allow update: if signedIn() && request.auth.uid in resource.data.participants
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['updatedAt']);
+      match /messages/{mid} {
+        allow read: if member(cid);
+        allow create: if member(cid) && request.resource.data.senderId == request.auth.uid
+          && request.resource.data.keys().hasOnly(['text','senderId','createdAt','deletedForEveryone','reactions','pinned'])
+          && request.resource.data.text is string && request.resource.data.text.size() <= 4000;
+        allow update: if member(cid) && (
+          (resource.data.senderId == request.auth.uid && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['text','deletedForEveryone','deletedAt','pinned','reactions','hiddenFor']))
+          || request.resource.data.diff(resource.data).affectedKeys().hasOnly(['reactions','hiddenFor','pinned'])
+        );
+        allow delete: if false;
       }
     }
+    match /calls/{callId} {
+      allow create: if signedIn() && request.resource.data.callerId == request.auth.uid
+        && request.resource.data.participants is list && request.auth.uid in request.resource.data.participants
+        && request.resource.data.participants.size() == 2 && request.resource.data.status == 'ringing';
+      allow read: if signedIn() && request.auth.uid in resource.data.participants;
+      allow update: if signedIn() && request.auth.uid in resource.data.participants
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['offer','answer','status','acceptedAt','endedAt']);
+      allow delete: if signedIn() && request.auth.uid in resource.data.participants;
+      match /candidates/{candidateUid}/items/{itemId} {
+        allow read, create: if signedIn() && request.auth.uid in get(/databases/$(database)/documents/calls/$(callId)).data.participants;
+        allow update, delete: if false;
+      }
+    }
+    match /{document=**} { allow read, write: if false; }
   }
 }
